@@ -782,6 +782,22 @@ int is_ll_address(uint32_t addr) {
         ((ntohl(addr) & 0x0000FF00) != 0xFF00);
 }
 
+static inline struct timeval *record_timestamp(struct timeval *tv) {
+    assert(tv);
+    gettimeofday(tv, NULL);
+    return tv;
+}
+
+static inline void clear_timestamp(struct timeval *tv) {
+    assert(tv);
+    memset(tv, 0, sizeof(*tv));
+}
+
+static inline int has_timestamp(struct timeval *tv) {
+    assert(tv);
+    return ((tv->tv_sec) && (tv->tv_usec));
+}
+
 static struct timeval *elapse_time(struct timeval *tv, unsigned msec, unsigned jitter) {
     assert(tv);
 
@@ -1053,7 +1069,7 @@ static int loop(int iface, uint32_t addr) {
     };
 
     int fd = -1, ret = -1;
-    struct timeval next_wakeup;
+    struct timeval next_wakeup, last_conflict;
     int next_wakeup_valid = 0;
     char buf[64];
     ArpPacket *in_packet = NULL;
@@ -1144,6 +1160,8 @@ static int loop(int iface, uint32_t addr) {
     pollfds[FD_SIGNAL].fd = daemon_signal_fd();
     pollfds[FD_SIGNAL].events = POLLIN;
 
+    clear_timestamp(&last_conflict);
+
     for (;;) {
         int r, timeout;
         AvahiUsec usec;
@@ -1218,10 +1236,34 @@ static int loop(int iface, uint32_t addr) {
 
                 if (info.sender_ip_address == addr) {
 
+                    /* Normal conflict? */
                     if (memcmp(hw_address, info.sender_hw_address, ETHER_ADDRLEN)) {
-                        /* Normal conflict */
-                        conflict = 1;
-                        daemon_log(LOG_INFO, "Received conflicting normal ARP packet.");
+                        int should_defend = (state == STATE_RUNNING);
+
+                        /* Have we seen any other conflicting ARP packets within the last DEFEND_INTERVAL seconds? */
+                        if ((should_defend) && (has_timestamp(&last_conflict))) {
+                            /* Check if the time recorded for the previous conflicting ARP packet is recent */
+                            usec = avahi_age(&last_conflict) / 1000ULL;
+                            if (usec > (DEFEND_INTERVAL * 1000)) {
+                                clear_timestamp(&last_conflict);
+                            }
+                        }
+                        if ((should_defend) && (!has_timestamp(&last_conflict))) {
+                           /* Attempt to defend our address by recording the time that the conflicting ARP packet
+                            * was received, and then broadcasting one single ARP announcement */
+                           daemon_log(LOG_DEBUG, "Received conflicting ARP packet, defend our IP");
+                           record_timestamp(&last_conflict);
+                           out_packet = packet_new_announcement(addr, hw_address, &out_packet_len);
+                        }
+                        else {
+                           /* If this is not the first conflicting ARP packet the host has seen, and the time
+                            * recorded for the previous conflicting ARP packet is recent, within DEFEND_INTERVAL
+                            * seconds, then the host MUST immediately cease using this address and configure a new
+                            * IPv4 Link-Local address */
+                           daemon_log(LOG_INFO, "Received conflicting ARP packet.");
+                           clear_timestamp(&last_conflict);
+                           conflict = 1;
+                        }
                     } else
                         daemon_log(LOG_DEBUG, "Received ARP packet back on source interface. Ignoring.");
 
